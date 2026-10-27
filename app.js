@@ -2,7 +2,31 @@
 // No network requests, external scripts, or backend. XLSX ZIP decompression uses browser DecompressionStream.
 const $=id=>document.getElementById(id), KRW=n=>Math.round(n).toLocaleString('ko-KR')+'원';
 const CATS=['식비','생활비','교통비','관리비','문화생활비','확인 필요','비용 제외'];
-let data=[], overrides=new Map();
+const RULES_KEY='family-budget.rules.v1';
+let data=[], overrides=new Map(), demoMode=false;
+function loadRules(){
+ try{
+  const stored=JSON.parse(localStorage.getItem(RULES_KEY)||'[]');
+  if(!Array.isArray(stored))throw Error('invalid rules');
+  const rules=new Map();
+  for(const entry of stored){
+   if(!Array.isArray(entry)||entry.length!==2)throw Error('invalid rule');
+   const [key,rule]=entry;
+   if(typeof key!=='string'||!rule||!CATS.includes(rule.category)||typeof rule.updatedAt!=='string'||!Number.isFinite(Date.parse(rule.updatedAt)))throw Error('invalid rule');
+   rules.set(key,{category:rule.category,updatedAt:rule.updatedAt});
+  }
+  $('rules-status').textContent=`이 브라우저에 저장된 분류 규칙: ${rules.size}개. 같은 금융기관·거래처에 다음 분석부터 자동 적용합니다.`;
+  return rules;
+ }catch(e){$('rules-status').textContent='저장된 규칙을 읽을 수 없습니다. 브라우저의 사이트 저장 허용 설정을 확인해 주세요.';return new Map();}
+}
+function saveRules(){
+ if(demoMode){$('rules-status').textContent='가상 데이터 체험 중입니다. 체험에서 바꾼 분류는 저장하지 않습니다.';return;}
+ try{localStorage.setItem(RULES_KEY,JSON.stringify([...overrides]));$('rules-status').textContent=`분류 규칙 ${overrides.size}개를 이 브라우저에 저장했습니다. 다음 방문에도 적용됩니다.`;}
+ catch(e){$('rules-status').textContent='분류는 이번 화면에만 적용되었습니다. 브라우저 저장에 실패해 다시 방문하면 사라질 수 있습니다.';}
+}
+function formatUpdatedAt(value){if(!value)return '—';const d=new Date(value),pad=n=>String(n).padStart(2,'0');return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;}
+function isProtected(x){return x.reason==='카드 취소 표시'||x.reason==='입금·환급';}
+
 const clean=s=>String(s??'').trim();
 const money=s=>Number(clean(s).replace(/[₩원,\s]/g,''))||0;
 function classify(name,type='',source=''){
@@ -65,19 +89,69 @@ function readToss(rows){const h=rows.findIndex(r=>r.includes('거래 일시')&&r
  if(signed<0&&/이체|송금|출금/.test(type)&&category==='확인 필요')reason='계좌이체 목적 확인';
  return {id:`T:${date}:${i}:${Math.abs(signed)}`,date,name,amount:Math.abs(signed),source:'토스뱅크',category,reason,rawType:type};
  }).filter(Boolean);}
+function readStatement(rows){
+ const normalized=rows.map(r=>r.map(clean));
+ const shinhan=normalized.some(r=>['거래일','가맹점명','금액'].every(h=>r.includes(h)));
+ const toss=normalized.some(r=>['거래 일시','거래 금액','적요'].every(h=>r.includes(h)));
+ if(shinhan&&toss)throw Error('두 금융기관의 제목 행이 함께 발견되어 파일 형식을 판별할 수 없습니다.');
+ if(!shinhan&&!toss)throw Error('지원하는 신한카드·토스뱅크 거래내역 형식이 아닙니다. 제목 행과 필수 열을 확인해 주세요.');
+ const source=shinhan?'신한카드':'토스뱅크',transactions=(shinhan?readShinhan:readToss)(normalized);
+ if(!transactions.length)throw Error(`${source} 형식이지만 분석 가능한 거래가 없습니다.`);
+ return {source,transactions};
+}
 function dedupe(list){const seen=new Set();return list.filter(x=>{if(seen.has(x.id))return false;seen.add(x.id);return true;});}
-function applyOverrides(){for(const x of data){if(overrides.has(x.source+'|'+x.name)&&x.reason!=='카드 취소 표시'&&x.reason!=='입금·환급'){x.category=overrides.get(x.source+'|'+x.name);x.reason='사용자 지정';}}}
+function applyOverrides(){for(const x of data){const rule=overrides.get(x.source+'|'+x.name);if(rule&&!isProtected(x)){x.category=rule.category;x.updatedAt=rule.updatedAt;x.reason='사용자 지정';}}}
 function months(){return [...new Set(data.map(x=>x.date.slice(0,7)))].sort().reverse();}
 function selected(){const m=$('month').value;return data.filter(x=>x.date.startsWith(m));}
 function render(){if(!data.length){$('results').hidden=true;return;}$('results').hidden=false;const mm=months(),old=$('month').value;$('month').replaceChildren(...mm.map(m=>new Option(m,m)));$('month').value=mm.includes(old)?old:mm[0];renderMonth();}
 function renderMonth(){const items=selected(),expense=items.filter(x=>!['확인 필요','비용 제외'].includes(x.category)),spent=expense.reduce((a,x)=>a+x.amount,0),pending=items.filter(x=>x.category==='확인 필요').reduce((a,x)=>a+x.amount,0);$('spent').textContent=KRW(spent);$('pending').textContent=KRW(pending);$('excluded').textContent=items.filter(x=>x.category==='비용 제외').length+'건';$('count').textContent=items.length+'건';
- $('bars').replaceChildren(...CATS.filter(x=>!['확인 필요','비용 제외'].includes(x)).map(c=>{const n=expense.filter(x=>x.category===c).reduce((a,x)=>a+x.amount,0),r=document.createElement('div');r.className='barrow';const title=document.createElement('span');title.textContent=c;const track=document.createElement('div');track.className='track';const fill=document.createElement('div');fill.className='fill';fill.style.width=(spent?100*n/spent:0)+'%';track.append(fill);const val=document.createElement('span');val.textContent=KRW(n);r.append(title,track,val);return r;}));
+ $('bars').replaceChildren(...CATS.filter(x=>!['확인 필요','비용 제외'].includes(x)).map(c=>{const n=expense.filter(x=>x.category===c).reduce((a,x)=>a+x.amount,0),r=document.createElement('div');r.className='barrow';const title=document.createElement('span');title.textContent=c;const track=document.createElement('div');track.className='track';const fill=document.createElement('div');fill.className='fill';fill.style.width=(spent?100*n/spent:0)+'%';track.append(fill);const val=document.createElement('span');val.className='barvalue';val.textContent=KRW(n);const percent=document.createElement('small');percent.textContent=(spent?100*n/spent:0).toFixed(1)+'%';val.append(percent);r.append(title,track,val);return r;}));
  const monthly=months().slice().reverse(),values=monthly.map(m=>data.filter(x=>x.date.startsWith(m)&&!['확인 필요','비용 제외'].includes(x.category)).reduce((a,x)=>a+x.amount,0)),max=Math.max(...values,1);$('trend').replaceChildren(...monthly.map((m,i)=>{const e=document.createElement('div');e.className='trenditem';const t=document.createElement('div');t.textContent=(values[i]/10000).toFixed(0)+'만';const bar=document.createElement('div');bar.className='trendbar';bar.style.height=Math.max(2,90*values[i]/max)+'px';const label=document.createElement('div');label.textContent=m;e.append(t,bar,label);return e;}));renderRows();}
-function renderRows(){const query=$('search').value.toLowerCase(),filter=$('filter').value;const list=selected().filter(x=>(filter==='all'||x.category===filter)&&x.name.toLowerCase().includes(query)).sort((a,b)=>b.date.localeCompare(a.date));const tbody=$('transactions');tbody.replaceChildren();for(const x of list.slice(0,350)){
- const tr=document.createElement('tr');for(const v of [x.date,x.source,x.name,KRW(x.amount)]){const td=document.createElement('td');td.textContent=v;if(v===KRW(x.amount))td.className='amount';tr.append(td);}const td=document.createElement('td'),select=document.createElement('select');for(const c of CATS)select.add(new Option(c,c));select.value=x.category;select.addEventListener('change',()=>{overrides.set(x.source+'|'+x.name,select.value);applyOverrides();renderMonth();});td.append(select);tr.append(td);const status=document.createElement('td');status.textContent=x.reason;status.className=x.category==='확인 필요'?'flag':'muted';tr.append(status);tbody.append(tr);
+function filteredTransactions(){const query=$('search').value.toLowerCase(),filter=$('filter').value,reason=$('reason-filter').value;return selected().filter(x=>(filter==='all'||x.category===filter)&&(reason==='all'||x.reason===reason)&&x.name.toLowerCase().includes(query));}
+function sortedTransactions(){
+ const sort=$('transaction-sort').value;
+ return filteredTransactions().sort((a,b)=>{
+  if(sort==='updated-desc'||sort==='updated-asc'){
+   if(!a.updatedAt||!b.updatedAt)return a.updatedAt?-1:b.updatedAt?1:b.date.localeCompare(a.date);
+   const delta=Date.parse(a.updatedAt)-Date.parse(b.updatedAt);
+   return (sort==='updated-asc'?delta:-delta)||b.date.localeCompare(a.date);
+  }
+  return b.date.localeCompare(a.date);
+ });
+}
+function renderRows(){const list=sortedTransactions();const tbody=$('transactions');tbody.replaceChildren();for(const x of list.slice(0,350)){
+ const tr=document.createElement('tr');for(const v of [x.date,x.source,x.name,KRW(x.amount)]){const td=document.createElement('td');td.textContent=v;if(v===KRW(x.amount))td.className='amount';tr.append(td);}const td=document.createElement('td'),select=document.createElement('select');for(const c of CATS)select.add(new Option(c,c));select.value=x.category;select.disabled=isProtected(x);select.addEventListener('change',()=>{overrides.set(x.source+'|'+x.name,{category:select.value,updatedAt:new Date().toISOString()});saveRules();applyOverrides();renderMonth();});td.append(select);tr.append(td);const status=document.createElement('td');status.textContent=x.reason;status.className=x.category==='확인 필요'?'flag':'muted';tr.append(status);const updated=document.createElement('td');updated.textContent=formatUpdatedAt(x.updatedAt);updated.className='updated-at';tr.append(updated);tbody.append(tr);
  }$('shown').textContent=`${list.length}건 중 최대 350건 표시 · CSV에는 필터된 전체 거래가 포함됩니다.`;}
-function exportCSV(){const filter=$('filter').value,query=$('search').value.toLowerCase();const rows=selected().filter(x=>(filter==='all'||x.category===filter)&&x.name.toLowerCase().includes(query));const cell=v=>'"'+String(v??'').replace(/"/g,'""')+'"';const csv='\ufeff'+[['날짜','출처','거래처','금액(원)','분류','상태'],...rows.map(x=>[x.date,x.source,x.name,x.amount,x.category,x.reason])].map(r=>r.map(cell).join(',')).join('\r\n');const url=URL.createObjectURL(new Blob([csv],{type:'text/csv;charset=utf-8'}));const a=document.createElement('a');a.href=url;a.download=`우리집가계부_${$('month').value}.csv`;a.click();setTimeout(()=>URL.revokeObjectURL(url),1000);}
-$('analyze').addEventListener('click',async()=>{const s=$('shinhan').files[0],t=$('toss').files[0];if(!s&&!t){$('status').textContent='신한카드 또는 토스뱅크 파일을 선택해 주세요.';return;}try{$('status').textContent='엑셀을 분석하고 있습니다…';let all=[];for(const [f,reader] of [[s,readShinhan],[t,readToss]])if(f){if(!f.name.toLowerCase().endsWith('.xlsx'))throw Error('.xlsx 형식만 지원합니다.');if(f.size>15*1024*1024)throw Error('파일 크기는 15MB 이하만 지원합니다.');const entries=await unzipEntries(await f.arrayBuffer());all.push(...reader(rowsFromXML(entries)));}data=dedupe(all);overrides.clear();$('filter').replaceChildren(new Option('전체 분류','all'),...CATS.map(c=>new Option(c,c)));$('status').textContent=`분석 완료: ${data.length.toLocaleString()}건 · 확인 필요 ${data.filter(x=>x.category==='확인 필요').length}건. 파일 원본은 서버로 전송되지 않았습니다.`;render();}catch(e){$('status').textContent='분석 실패: '+e.message;console.error(e);}});
-$('demo').addEventListener('click',()=>{const names=['식자재마트','스타벅스','메트로주유소','쿠팡페이','상가 관리비','CGV','신한카드대금','다이소'];data=Array.from({length:90},(_,i)=>{const month=String(7+Math.floor(i/30)).padStart(2,'0'),name=names[i%names.length],amount=10000+(i%11)*6900,[category,reason]=classify(name,'','토스뱅크');return {id:'D'+i,date:`2026-${month}-${String(i%28+1).padStart(2,'0')}`,name,amount,source:i%2?'토스뱅크':'신한카드',category,reason};});overrides.clear();$('filter').replaceChildren(new Option('전체 분류','all'),...CATS.map(c=>new Option(c,c)));$('status').textContent='가상 데이터 90건을 불러왔습니다. 실제 금융정보가 아닙니다.';render();});
-$('clear').addEventListener('click',()=>{data=[];overrides.clear();$('shinhan').value='';$('toss').value='';$('results').hidden=true;$('status').textContent='분석 데이터를 초기화했습니다.';});
-$('month').addEventListener('change',renderMonth);$('search').addEventListener('input',renderRows);$('filter').addEventListener('change',renderRows);$('export').addEventListener('click',exportCSV);
+function exportCSV(){const rows=sortedTransactions();const cell=v=>'"'+String(v??'').replace(/"/g,'""')+'"';const csv='\ufeff'+[['날짜','출처','거래처','금액(원)','분류','상태','분류 수정 일시'],...rows.map(x=>[x.date,x.source,x.name,x.amount,x.category,x.reason,formatUpdatedAt(x.updatedAt)])].map(r=>r.map(cell).join(',')).join('\r\n');const url=URL.createObjectURL(new Blob([csv],{type:'text/csv;charset=utf-8'}));const a=document.createElement('a');a.href=url;a.download=`우리집가계부_${$('month').value}.csv`;a.click();setTimeout(()=>URL.revokeObjectURL(url),1000);}
+$('analyze').addEventListener('click',async()=>{
+ const files=Array.from($('statements').files);
+ if(!files.length){$('status').textContent='거래내역 엑셀 파일을 선택해 주세요.';return;}
+ const controls=['analyze','statements','demo','clear'];
+ controls.forEach(id=>$(id).disabled=true);
+ try{
+  $('status').textContent='엑셀을 분석하고 있습니다…';
+  const all=[],summaries=[];
+  for(const f of files){
+   try{
+    if(!f.name.toLowerCase().endsWith('.xlsx'))throw Error('.xlsx 형식만 지원합니다.');
+    if(f.size>15*1024*1024)throw Error('파일 크기는 15MB 이하만 지원합니다.');
+    const entries=await unzipEntries(await f.arrayBuffer());
+    const {source,transactions}=readStatement(rowsFromXML(entries));
+    all.push(...transactions);
+    summaries.push(`${f.name} → ${source} ${transactions.length.toLocaleString()}건`);
+   }catch(e){throw Error(`${f.name}: ${e.message}`);}
+  }
+  data=dedupe(all);demoMode=false;overrides=loadRules();applyOverrides();$('reason-filter').value='all';
+  $('filter').replaceChildren(new Option('전체 분류','all'),...CATS.map(c=>new Option(c,c)));
+  $('status').textContent=`분석 완료: ${files.length}개 파일 · ${data.length.toLocaleString()}건 · 확인 필요 ${data.filter(x=>x.category==='확인 필요').length}건\n${summaries.join('\n')}\n파일 원본은 서버로 전송되지 않았습니다.`;
+  render();
+ }catch(e){$('status').textContent='분석 실패: '+e.message+'\n선택한 파일은 반영하지 않았습니다. 기존 분석 결과가 있다면 유지됩니다.';console.error(e);}
+ finally{controls.forEach(id=>$(id).disabled=false);}
+});
+$('demo').addEventListener('click',()=>{const names=['식자재마트','스타벅스','메트로주유소','쿠팡페이','상가 관리비','CGV','신한카드대금','다이소'];data=Array.from({length:90},(_,i)=>{const month=String(7+Math.floor(i/30)).padStart(2,'0'),name=names[i%names.length],amount=10000+(i%11)*6900,[category,reason]=classify(name,'','토스뱅크');return {id:'D'+i,date:`2026-${month}-${String(i%28+1).padStart(2,'0')}`,name,amount,source:i%2?'토스뱅크':'신한카드',category,reason};});demoMode=true;overrides=new Map();$('rules-status').textContent='가상 데이터 체험 중입니다. 체험에서 바꾼 분류는 저장하지 않습니다.';$('reason-filter').value='all';$('filter').replaceChildren(new Option('전체 분류','all'),...CATS.map(c=>new Option(c,c)));$('status').textContent='가상 데이터 90건을 불러왔습니다. 실제 금융정보가 아닙니다.';render();});
+$('clear').addEventListener('click',()=>{data=[];demoMode=false;overrides=loadRules();$('statements').value='';$('reason-filter').value='all';$('results').hidden=true;$('status').textContent='분석 데이터를 초기화했습니다. 저장된 분류 규칙은 유지됩니다.';});
+$('month').addEventListener('change',renderMonth);$('search').addEventListener('input',renderRows);$('filter').addEventListener('change',renderRows);$('reason-filter').addEventListener('change',renderRows);$('export').addEventListener('click',exportCSV);
+
+$('transaction-sort').addEventListener('change',renderRows);
+$('recent-edits').addEventListener('click',()=>{$('search').value='';$('filter').value='all';$('reason-filter').value='사용자 지정';$('transaction-sort').value='updated-desc';renderRows();});
+overrides=loadRules();
